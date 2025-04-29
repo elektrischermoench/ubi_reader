@@ -20,6 +20,7 @@
 import os
 import struct
 
+from ubireader.ubifs.decrypt import lookup_inode_nonce, derive_key_from_nonce, datablock_decrypt, decrypt_symlink_target, decrypt_filenames
 from ubireader import settings
 from ubireader.ubifs.defines import *
 from ubireader.ubifs import walk
@@ -45,6 +46,7 @@ def extract_files(ubifs, out_path, perms=False):
 
         walk.index(ubifs, ubifs.master_node.root_lnum, ubifs.master_node.root_offs, inodes, bad_blocks)
 
+        decrypt_filenames(ubifs, inodes)
         if len(inodes) < 2:
             raise Exception('No inodes found')
 
@@ -65,10 +67,10 @@ def extract_dents(ubifs, inodes, dent_node, path='', perms=False):
 
     inode = inodes[dent_node.inum]
 
-    if not is_safe_path(path, dent_node.name):
-        error(extract_dents, 'Warn', 'Path traversal attempt: %s, discarding.' % (dent_node.name))
+    if not is_safe_path(path, dent_node.name.decode()):
+        error(extract_dents, 'Warn', 'Path traversal attempt: %s, discarding.' % (dent_node.name.decode()))
         return
-    dent_path = os.path.realpath(os.path.join(path, dent_node.name))
+    dent_path = os.path.realpath(os.path.join(path, dent_node.name.decode()))
 
     if dent_node.type == UBIFS_ITYPE_DIR:
         try:
@@ -92,13 +94,13 @@ def extract_dents(ubifs, inodes, dent_node, path='', perms=False):
             if inode['ino'].nlink > 1:
                 if 'hlink' not in inode:
                     inode['hlink'] = dent_path
-                    buf = _process_reg_file(ubifs, inode, dent_path)
+                    buf = _process_reg_file(ubifs, inode, dent_path, inodes)
                     _write_reg_file(dent_path, buf)
                 else:
                     os.link(inode['hlink'], dent_path)
                     log(extract_dents, 'Make Link: %s > %s' % (dent_path, inode['hlink']))
             else:
-                buf = _process_reg_file(ubifs, inode, dent_path)
+                buf = _process_reg_file(ubifs, inode, dent_path, inodes)
                 _write_reg_file(dent_path, buf)
 
             _set_file_timestamps(dent_path, inode)
@@ -112,7 +114,9 @@ def extract_dents(ubifs, inodes, dent_node, path='', perms=False):
     elif dent_node.type == UBIFS_ITYPE_LNK:
         try:
             # probably will need to decompress ino data if > UBIFS_MIN_COMPR_LEN
-            os.symlink('%s' % inode['ino'].data.decode('utf-8'), dent_path)
+            inode = inodes[dent_node.inum]
+            lnkname = decrypt_symlink_target(ubifs, inodes, dent_node)
+            os.symlink('%s' % lnkname, dent_path)
             log(extract_dents, 'Make Symlink: %s > %s' % (dent_path, inode['ino'].data))
 
         except Exception as e:
@@ -172,7 +176,7 @@ def _write_reg_file(path, data):
     log(_write_reg_file, 'Make File: %s' % (path))
 
 
-def _process_reg_file(ubifs, inode, path):
+def _process_reg_file(ubifs, inode, path, inodes):
     try:
         buf = bytearray()
         start_key = 0x00 | (UBIFS_DATA_KEY << UBIFS_S_KEY_BLOCK_BITS)
@@ -181,19 +185,33 @@ def _process_reg_file(ubifs, inode, path):
             sorted_data = sorted(inode['data'], key=lambda x: x.key['khash'])
             last_khash = start_key - 1 
 
-            for data in sorted_data:
+            for block_cnt, block_data in enumerate(sorted_data):
                 # If data nodes are missing in sequence, fill in blanks
                 # with \x00 * UBIFS_BLOCK_SIZE
-                if data.key['khash'] - last_khash != 1:
-                    while 1 != (data.key['khash'] - last_khash):
-                        buf += b'\x00'*UBIFS_BLOCK_SIZE
+                if block_data.key['khash'] - last_khash != 1:
+                    while 1 != (block_data.key['khash'] - last_khash):
+                        buf += b'\x00' * UBIFS_BLOCK_SIZE
                         last_khash += 1
 
-                compr_type = data.compr_type
-                ubifs.file.seek(data.offset)
-                d = ubifs.file.read(data.compr_len)
-                buf += decompress(compr_type, data.size, d)
-                last_khash = data.key['khash']
+                compr_type = block_data.compr_type
+                ubifs.file.seek(block_data.offset)
+                d = ubifs.file.read(block_data.compr_len)
+                if ubifs.master_key is not None:
+                    nonce = lookup_inode_nonce(inodes, inode)
+                    block_key = derive_key_from_nonce(ubifs.master_key, nonce)
+                    # block_id is based on the current hash
+                    # there could be empty blocks
+                    block_id = block_data.key['khash']-start_key
+                    block_iv = struct.pack("<QQ", block_id, 0)
+                    decrypted_block = datablock_decrypt(block_key, block_iv, d)
+                    buf += decompress(compr_type, block_data.size, decrypted_block)
+                    # need to unpad the last element
+                    if block_cnt == len(sorted_data) - 1:
+                        buf = buf.rstrip(b'\x00')
+                else:
+                    buf += decompress(compr_type, block_data.size, d)
+
+                last_khash = block_data.key['khash']
                 verbose_log(_process_reg_file, 'ino num: %s, compression: %s, path: %s' % (inode['ino'].key['ino_num'], compr_type, path))
 
     except Exception as e:
